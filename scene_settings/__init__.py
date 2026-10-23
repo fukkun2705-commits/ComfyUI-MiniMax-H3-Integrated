@@ -1,5 +1,6 @@
 """Scene JSON loader for existing MiniMax H3 R2V workflow; one node per clip."""
 import json
+import hashlib
 import os
 from pathlib import Path
 import numpy as np
@@ -21,6 +22,22 @@ def _safe_input_file(value, purpose):
     if not candidate.is_file():
         raise FileNotFoundError(f'{purpose}: missing file under ComfyUI/input/: {value}')
     return candidate
+
+
+def _scene_digest(scene_json):
+    """Fingerprint on-disk Scene settings, not a cached UI/widget value."""
+    path = _safe_input_file(scene_json, 'scene JSON')
+    return hashlib.sha256(path.read_bytes()).digest()
+
+
+def _asset_snapshot(names, purpose):
+    """Record media state so concurrent changes cannot silently mix revisions."""
+    state = []
+    for name in names:
+        path = _safe_input_file(name, purpose)
+        st = path.stat()
+        state.append((name, st.st_size, st.st_mtime_ns, st.st_ctime_ns))
+    return tuple(state)
 
 
 def _load_image(name):
@@ -127,30 +144,24 @@ class H3SceneClipLoader:
 
     @classmethod
     def IS_CHANGED(cls, scene_json, clip_index):
-        # Cache invalidation for both JSON and the referenced image files.
-        import hashlib
-        h = hashlib.sha256()
-        try:
-            prompt, refs, duration, audios, videos = _get_clip(scene_json, clip_index)
-            files = [_safe_input_file(scene_json,'scene JSON')] + [_safe_input_file(x,'reference image') for x in refs] + [_safe_input_file(x,'reference audio') for x in audios] + [_safe_input_file(x,'reference video') for x in videos]
-            for p in files:
-                h.update(str(p).encode('utf-8'))
-                # file contents: detects edits even if timestamps are preserved
-                with p.open('rb') as f:
-                    for chunk in iter(lambda:f.read(1024*1024),b''):
-                        h.update(chunk)
-            h.update(str(clip_index).encode())
-            return h.hexdigest()
-        except Exception as exc:
-            return f'INVALID:{type(exc).__name__}:{exc}'
+        # ComfyUI may reuse a cached output while an external Scene Editor
+        # updates scenes.json. Force reevaluation for each queued execution,
+        # so changed Duration/Prompt/References cannot remain stale.
+        # Note: this also reloads referenced media when the node executes.
+        return float("nan")
 
     def load(self, scene_json, clip_index):
+        before = _scene_digest(scene_json)
         prompt, refs, duration, audios, videos = _get_clip(scene_json, clip_index)
         if not refs:
             # T2VA has no reference image: these placeholders MUST NOT be connected
             # to a ReferenceToVideo conditioning node. The WF mode branch must bypass it.
             blank = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+            if _scene_digest(scene_json) != before:
+                raise RuntimeError(f'Clip {clip_index}: scenes.json changed during loading; save Scene Editor settings and queue again')
             return (prompt, blank, blank, blank, duration, None, None, None, None, None, None, None, None, None, None, None, None)
+        assets = [(x, 'reference image') for x in refs] + [(x, 'reference audio') for x in audios] + [(x, 'reference video') for x in videos]
+        asset_before = tuple((name, purpose, _asset_snapshot([name], purpose)) for name, purpose in assets)
         images = [_load_image(x) for x in refs]
         # Keep the original 3-IMAGE output contract without requiring a third file.
         # When only two reference images exist, reuse image 2 in slot 3.
@@ -165,6 +176,11 @@ class H3SceneClipLoader:
         video_objs = [_load_video(v) for v in videos]
         while len(video_objs)<3:
             video_objs.append(None)
+        if _scene_digest(scene_json) != before:
+            raise RuntimeError(f'Clip {clip_index}: scenes.json changed while references were loading; queue again after saving')
+        asset_after = tuple((name, purpose, _asset_snapshot([name], purpose)) for name, purpose in assets)
+        if asset_before != asset_after:
+            raise RuntimeError(f'Clip {clip_index}: reference files changed while loading; queue again after the files are stable')
         return (prompt, images[0], images[1], images[2], duration, *additional[:2], *audio_objs[:2], video_objs[0], *additional[2:], *video_objs[1:], audio_objs[2])
 
 NODE_CLASS_MAPPINGS = {'H3SceneClipLoader': H3SceneClipLoader}

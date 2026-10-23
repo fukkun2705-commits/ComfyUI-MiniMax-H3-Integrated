@@ -13,19 +13,22 @@ class H3PartVideoTail:
         return {'required': {
             'video_path': ('STRING', {'default': '', 'multiline': False}),
             'tail_frames': ('INT', {'default': 22, 'min': 1, 'max': 999}),
+            'part_mode_flag': ('INT', {'default': 0, 'min': 0, 'max': 1}),
         }}
 
-    RETURN_TYPES = ('IMAGE', 'INT')
-    RETURN_NAMES = ('context_frames', 'frame_count')
+    RETURN_TYPES = ('IMAGE', 'INT', 'STRING')
+    RETURN_NAMES = ('context_frames', 'frame_count', 'video_path_out')
     FUNCTION = 'read'
     CATEGORY = 'H3/Part Continuation'
 
     @classmethod
-    def IS_CHANGED(cls, video_path, tail_frames):
+    def IS_CHANGED(cls, video_path, tail_frames, part_mode_flag=0):
+        if int(part_mode_flag) == 0:
+            return ('NEW_no_previous_mp4', int(tail_frames))
         p = cls._path(video_path)
         try:
             st = os.stat(p)
-            return (p, st.st_mtime_ns, st.st_size, tail_frames)
+            return (p, st.st_mtime_ns, st.st_size, tail_frames, int(part_mode_flag))
         except OSError:
             return float('nan')
 
@@ -36,7 +39,12 @@ class H3PartVideoTail:
             return p
         return os.path.join(folder_paths.get_output_directory(), p)
 
-    def read(self, video_path, tail_frames):
+    def read(self, video_path, tail_frames, part_mode_flag=0):
+        # NEW: do not open, stat or decode any old MP4. ComfyUI eagerly
+        # evaluates the tail input even when downstream selectors bypass it.
+        if int(part_mode_flag) == 0:
+            print('[H3PartVideoTail] NEW: previous-Part MP4 read skipped')
+            return (torch.zeros((int(tail_frames), 64, 64, 3), dtype=torch.float32), 0, str(video_path))
         path = self._path(video_path)
         if not os.path.isfile(path):
             raise FileNotFoundError('H3 Part Video Tail: MP4 not found: ' + path)
@@ -57,7 +65,7 @@ class H3PartVideoTail:
         cap.release()
         if len(frames) != int(tail_frames):
             raise RuntimeError(f'H3 Part Video Tail: only read {len(frames)}/{tail_frames} tail frames; check MP4 seek/index')
-        return (torch.from_numpy(np.stack(frames).astype(np.float32) / 255.0), count)
+        return (torch.from_numpy(np.stack(frames).astype(np.float32) / 255.0), count, str(video_path))
 
 NODE_CLASS_MAPPINGS = {'H3PartVideoTail': H3PartVideoTail}
 NODE_DISPLAY_NAME_MAPPINGS = {'H3PartVideoTail': 'H3 Part — Load MP4 Tail Frames'}
